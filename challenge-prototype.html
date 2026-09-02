@@ -601,7 +601,7 @@
   const STATE_KEY = "challenge_proto_v2";
 
   let state = null;
-  const ui = { route:"home", chId:null, liveChId:null, draft:null, result:null, modal:null, rankTab:"community", pick:null, resolvePick:null, bannerDismissed:false, disputeReason:null, confirmReset:false, sessionId:null, sessionForm:null, confirmEndSession:false, showDemo:false };
+  const ui = { route:"home", chId:null, liveChId:null, draft:null, result:null, modal:null, rankTab:"community", pick:null, resolvePick:null, lgReResolve:false, bannerDismissed:false, disputeReason:null, confirmReset:false, sessionId:null, sessionForm:null, confirmEndSession:false, showDemo:false };
 
   /* =========================================================
      helpers
@@ -1489,7 +1489,8 @@
   async function lgResolve(chId, outcomeRaw){
     await lgPoll(true); // frische Tipps holen, bevor gewertet wird
     const c = ((LG.data && LG.data.challenges) || []).find(x=>x.id === chId);
-    if(!c || c.status !== "open") throw new Error("Challenge ist schon aufgelöst.");
+    if(!c) throw new Error("Challenge nicht gefunden.");
+    const wasResolved = c.status === "resolved";
     const tips = ((LG.data && LG.data.tips) || []).filter(t=>t.challenge_id === chId);
     const pseudo = {
       type:c.type, options:c.options || [], num:{ dec: !!c.num_dec },
@@ -1509,13 +1510,13 @@
       factor = Math.round(f * 100) / 100;
       pseudo.participants.forEach(p => p.payoutCp = p.correct ? Math.round(SESSION_BASE * f) : 0);
     }
-    await lgReq("PATCH", "challenges?id=eq." + chId + "&status=eq.open", { status:"resolved", outcome:String(outcome), factor });
+    await lgReq("PATCH", "challenges?id=eq." + chId, { status:"resolved", outcome:String(outcome), factor });
     for(const p of pseudo.participants){
       await lgReq("PATCH", "tips?challenge_id=eq." + chId + "&player_id=eq." + encodeURIComponent(p.id),
         { correct: !!p.correct, rank: p.rank, points: p.payoutCp });
     }
     await lgPoll(true);
-    return { outcome, factor };
+    return { outcome, factor, wasResolved };
   }
   async function lgEndGroup(){
     await lgPoll(true);
@@ -2945,16 +2946,31 @@
       }).join("") + `</ul>`;
     }
 
-    // Auflösen (Ersteller:in oder Host)
+    // Auflösen bzw. Neu auflösen (Ersteller:in oder Host)
+    const picker = c.type === "NUMBER"
+      ? `<input class="num-input mono" type="text" inputmode="${c.num_dec?'decimal':'numeric'}" placeholder="${c.num_dec?'z. B. 4,20':'z. B. 3'}" data-lg-resolve-num aria-label="Ergebnis" style="font-size:26px;padding:14px">`
+      : `<div class="opt-grid">` + (c.options||[]).map(o=>`<button class="opt" data-lg-rpick="${o.key}" aria-pressed="${ui.resolvePick===o.key}"><span>${esc(o.label)}</span><span class="dot"></span></button>`).join("") + `</div>`;
+    const goDisabled = (c.type==="NUMBER" || ui.resolvePick!=null) ? "" : "disabled";
+
     if(st !== "resolved" && isCreator && !ended){
       h += `<div class="dur-box" style="margin-top:24px;border-color:color-mix(in srgb,var(--accent) 45%,var(--line-strong))">
         <h3 style="font-size:15px;margin-bottom:4px">Auflösen & beenden</h3>
         <p class="hint" style="margin-bottom:12px">Trägst du das Ergebnis ein, <b>endet die Challenge sofort für alle</b> – auch vor Ablauf der Zeit.</p>
-        ${c.type === "NUMBER"
-          ? `<input class="num-input mono" type="text" inputmode="${c.num_dec?'decimal':'numeric'}" placeholder="${c.num_dec?'z. B. 4,20':'z. B. 3'}" data-lg-resolve-num aria-label="Ergebnis" style="font-size:26px;padding:14px">`
-          : `<div class="opt-grid">` + (c.options||[]).map(o=>`<button class="opt" data-lg-rpick="${o.key}" aria-pressed="${ui.resolvePick===o.key}"><span>${esc(o.label)}</span><span class="dot"></span></button>`).join("") + `</div>`}
-        <button class="btn" style="margin-top:12px" data-act="lg-resolve-go" ${(c.type==="NUMBER"||ui.resolvePick!=null)?"":"disabled"}>Ergebnis eintragen &amp; beenden</button>
+        ${picker}
+        <button class="btn" style="margin-top:12px" data-act="lg-resolve-go" ${goDisabled}>Ergebnis eintragen &amp; beenden</button>
       </div>`;
+    } else if(st === "resolved" && isCreator && !ended){
+      h += ui.lgReResolve
+        ? `<div class="dur-box" style="margin-top:20px;border-color:color-mix(in srgb,var(--hot) 45%,var(--line-strong))">
+             <h3 style="font-size:15px;margin-bottom:4px">Ergebnis korrigieren</h3>
+             <p class="hint" style="margin-bottom:12px">Trag das richtige Ergebnis ein – die Punkte werden für <b>alle</b> neu berechnet.</p>
+             ${picker}
+             <div style="display:flex;gap:8px;margin-top:12px">
+               <button class="btn subtle" style="flex:1" data-act="lg-rr-cancel">Abbrechen</button>
+               <button class="btn" style="flex:1;background:var(--hot)" data-act="lg-resolve-go" ${goDisabled}>Neu auflösen</button>
+             </div>
+           </div>`
+        : `<button class="btn subtle" style="width:100%;margin-top:16px" data-act="lg-rr-open">⚖ Ergebnis korrigieren</button>`;
     }
     return h + `</div>`;
   }
@@ -3080,6 +3096,7 @@
     if(opts && opts.chId) ui.chId = opts.chId;
     if(route!=="challenge" && route!=="dispute" && route!=="liveChallenge") ui.pick = null;
     if(route!=="challenge" && route!=="liveChallenge") ui.resolvePick = null;
+    if(route!=="liveChallenge") ui.lgReResolve = false;
     if(route!=="dispute") ui.disputeReason = null;
     ui.confirmReset = false;
     ui.confirmEndSession = false;
@@ -3298,9 +3315,12 @@
           .catch(err=>toast(String(err.message||err)));
         break;
       }
+      case "lg-rr-open": ui.lgReResolve = true; ui.resolvePick = null; render(); break;
+      case "lg-rr-cancel": ui.lgReResolve = false; ui.resolvePick = null; render(); break;
       case "lg-resolve-go": {
         const c = ((LG.data&&LG.data.challenges)||[]).find(x=>x.id===ui.liveChId);
         if(!c) return;
+        const redo = c.status === "resolved";
         let out = ui.resolvePick;
         if(c.type === "NUMBER"){
           const inp = document.querySelector("[data-lg-resolve-num]");
@@ -3309,9 +3329,9 @@
           out = String(c.num_dec ? round2(n) : Math.round(n));
         }
         if(out == null || out === "") return toast("Bitte zuerst das Ergebnis wählen");
-        ui.resolvePick = null;
-        toast("Wird aufgelöst …");
-        lgResolve(ui.liveChId, out).then(()=>{ toast("Challenge beendet"); render(); })
+        ui.resolvePick = null; ui.lgReResolve = false;
+        toast(redo ? "Wird neu berechnet …" : "Wird aufgelöst …");
+        lgResolve(ui.liveChId, out).then(()=>{ toast(redo ? "Ergebnis korrigiert · Punkte angepasst" : "Challenge beendet"); render(); })
           .catch(err=>toast(String(err.message||err)));
         break;
       }
