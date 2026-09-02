@@ -601,7 +601,7 @@
   const STATE_KEY = "challenge_proto_v2";
 
   let state = null;
-  const ui = { route:"home", chId:null, liveChId:null, draft:null, result:null, modal:null, rankTab:"community", pick:null, resolvePick:null, lgReResolve:false, bannerDismissed:false, disputeReason:null, confirmReset:false, sessionId:null, sessionForm:null, confirmEndSession:false, showDemo:false };
+  const ui = { route:"home", chId:null, liveChId:null, liveClaimGroup:null, liveClaimMembers:null, liveClaimPick:null, draft:null, result:null, modal:null, rankTab:"community", pick:null, resolvePick:null, lgReResolve:false, bannerDismissed:false, disputeReason:null, confirmReset:false, sessionId:null, sessionForm:null, confirmEndSession:false, showDemo:false };
 
   /* =========================================================
      helpers
@@ -1442,19 +1442,45 @@
   async function lgCreateGroup(name){
     const code = shortcode();
     await lgReq("POST", "groups", { id:code, name:(name||"").trim() || "Jungswochenende", host_id:LG.playerId });
-    await lgJoinGroup(code);
+    await lgEnterGroup(code);
     return code;
   }
-  async function lgJoinGroup(code){
+  // Beitreten: prüft, ob mein Gerät die Gruppe schon kennt. Wenn nicht und es gibt
+  // schon Mitglieder -> "Das bin ich"-Auswahl (status "claim"), sonst direkt rein.
+  async function lgJoinGroup(code, opts){
     code = String(code||"").toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,6);
     if(!code) throw new Error("Bitte einen Code eingeben.");
     const g = await lgReq("GET", "groups?id=eq." + code + "&select=id,status");
     if(!g || !g.length) throw new Error("Keine Gruppe mit dem Code " + code + ".");
+    const members = await lgReq("GET", "members?group_id=eq." + code + "&select=*&order=joined_at.asc") || [];
+    const iAmMember = members.some(m => m.player_id === LG.playerId);
+    if(iAmMember || (opts && opts.asNew) || members.length === 0){
+      await lgEnterGroup(code);
+      return { status:"joined" };
+    }
+    ui.liveClaimGroup = code;
+    ui.liveClaimMembers = members;
+    ui.liveClaimPick = null;
+    return { status:"claim" };
+  }
+  async function lgEnterGroup(code){
     await lgReq("POST", "members?on_conflict=group_id,player_id",
       { group_id:code, player_id:LG.playerId, name:(state.user.username||"Spieler").slice(0,20), avatar:state.user.avatar || "🦊" },
       { "Prefer": "resolution=merge-duplicates,return=minimal" });
     LG.groupId = code; LG.data = null; LG.lastHash = "";
     try{ localStorage.setItem("challenge_live_group", code); localStorage.removeItem("challenge_live_pendinggroup"); }catch(e){}
+    ui.liveClaimGroup = null; ui.liveClaimMembers = null; ui.liveClaimPick = null;
+    await lgPoll(true);
+  }
+  // Bestehenden Platz übernehmen: player_id des gewählten Mitglieds wird meine.
+  async function lgClaimAs(pid){
+    const code = ui.liveClaimGroup;
+    if(!code || !pid) return;
+    LG.playerId = pid;
+    try{ localStorage.setItem("challenge_player_id", pid); }catch(e){}
+    LG.groupId = code; LG.data = null; LG.lastHash = "";
+    try{ localStorage.setItem("challenge_live_group", code); localStorage.removeItem("challenge_live_pendinggroup"); }catch(e){}
+    ui.liveClaimGroup = null; ui.liveClaimMembers = null; ui.liveClaimPick = null;
     await lgPoll(true);
   }
   function lgLeaveGroup(){
@@ -1593,7 +1619,7 @@
     try{ pending = localStorage.getItem("challenge_live_pendinggroup"); }catch(e){}
     if(pending && pending !== LG.groupId){
       lgJoinGroup(pending)
-        .then(()=>{ toast("Gruppe beigetreten"); go("liveGroup"); })
+        .then(res=>{ if(res.status === "claim"){ go("liveClaim"); } else { toast("Gruppe beigetreten"); go("liveGroup"); } })
         .catch(err=>{ toast(String(err.message||err)); try{ localStorage.removeItem("challenge_live_pendinggroup"); }catch(e){} });
     } else if(LG.groupId){
       lgPoll(true);
@@ -2992,6 +3018,41 @@
       <button class="opt" data-pick="${o.key}" aria-pressed="${ui.pick===o.key}"><span>${esc(o.label)}</span><span class="dot"></span></button>`).join("") + `</div>`;
   }
 
+  // "Bist du schon dabei?" — beim Beitreten einen bestehenden Platz übernehmen
+  function viewLiveClaim(){
+    const members = ui.liveClaimMembers || [];
+    const pick = ui.liveClaimPick;
+    let h = `<div class="view-enter">
+      <button class="back-btn" data-act="lg-claim-back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg> Abbrechen</button>
+      <h1 style="font-size:21px;margin:14px 2px 4px">Bist du schon dabei?</h1>
+      <p class="hint" style="margin:0 2px 16px">Diese Gruppe hat schon Mitglieder. Warst du vorher schon dabei – nur mit einem anderen Handy, im Inkognito-Fenster oder nach dem Löschen der Browserdaten? Dann wähl dich hier aus, du <b>behältst deine Punkte</b>.</p>`;
+
+    if(pick){
+      const m = members.find(x=>x.player_id === pick);
+      h += `<div class="dur-box" style="border-color:color-mix(in srgb,var(--accent) 45%,var(--line-strong))">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+          <span style="font-size:28px">${m?m.avatar:"🎯"}</span>
+          <div><b style="font-size:16px">${m?esc(m.name):"?"}</b><div class="hint">Du übernimmst diesen Platz samt bisheriger Punkte.</div></div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn subtle" style="flex:1" data-act="lg-claim-cancel-pick">Zurück</button>
+          <button class="btn" style="flex:1" data-act="lg-claim-confirm">Das bin ich</button>
+        </div>
+      </div>`;
+      return h + `</div>`;
+    }
+
+    h += `<div class="card" style="padding:6px 0;margin-bottom:14px">`;
+    h += members.map(m=>`<button class="rank-row" data-act="lg-claim" data-pid="${esc(m.player_id)}" style="width:100%;text-align:left;background:none">
+      <span class="rank-av">${m.avatar}</span>
+      <span class="rank-name" style="flex:1">${esc(m.name)}</span>
+      <span class="rank-score" style="font-size:13px;color:var(--ink-faint)">›</span>
+    </button>`).join("");
+    h += `</div>`;
+    h += `<button class="btn ghost" style="width:100%" data-act="lg-claim-new">Ich bin neu hier</button>`;
+    return h + `</div>`;
+  }
+
   function todayHints(){
     const d = new Date(), day = d.getDay(), hr = d.getHours();
     const byDay = {
@@ -3089,7 +3150,7 @@
   /* =========================================================
      router
   ========================================================= */
-  const VIEWS = { home:viewHome, challenge:viewChallenge, create:viewCreate, ranking:viewRanking, profile:viewProfile, dispute:viewDispute, sessions:viewSessions, session:viewSession, liveGroup:viewLiveGroup, liveChallenge:viewLiveChallenge, ideas:viewIdeas, onboarding:viewOnboarding };
+  const VIEWS = { home:viewHome, challenge:viewChallenge, create:viewCreate, ranking:viewRanking, profile:viewProfile, dispute:viewDispute, sessions:viewSessions, session:viewSession, liveGroup:viewLiveGroup, liveChallenge:viewLiveChallenge, liveClaim:viewLiveClaim, ideas:viewIdeas, onboarding:viewOnboarding };
 
   function go(route, opts){
     ui.route = route;
@@ -3097,6 +3158,7 @@
     if(route!=="challenge" && route!=="dispute" && route!=="liveChallenge") ui.pick = null;
     if(route!=="challenge" && route!=="liveChallenge") ui.resolvePick = null;
     if(route!=="liveChallenge") ui.lgReResolve = false;
+    if(route!=="liveClaim") ui.liveClaimPick = null;
     if(route!=="dispute") ui.disputeReason = null;
     ui.confirmReset = false;
     ui.confirmEndSession = false;
@@ -3289,11 +3351,32 @@
       case "lg-join-go": {
         const code = (document.querySelector("[data-lg-code]")||{}).value || "";
         toast("Beitreten …");
-        lgJoinGroup(code).then(()=>{ ui.sessionForm = null; toast("Beigetreten"); go("liveGroup"); })
+        lgJoinGroup(code).then(res=>{ ui.sessionForm = null;
+          if(res.status === "claim"){ go("liveClaim"); }
+          else { toast("Beigetreten"); go("liveGroup"); } })
           .catch(err=>toast(String(err.message||err)));
         break;
       }
       case "lg-open": go("liveGroup"); break;
+      case "lg-claim": ui.liveClaimPick = t.dataset.pid; render(); break;
+      case "lg-claim-cancel-pick": ui.liveClaimPick = null; render(); break;
+      case "lg-claim-back": ui.liveClaimGroup = null; ui.liveClaimMembers = null; ui.liveClaimPick = null;
+        try{ localStorage.removeItem("challenge_live_pendinggroup"); }catch(e){}
+        go("sessions"); break;
+      case "lg-claim-confirm": {
+        const pid = ui.liveClaimPick;
+        toast("Platz wird übernommen …");
+        lgClaimAs(pid).then(()=>{ toast("Willkommen zurück"); go("liveGroup"); })
+          .catch(err=>toast(String(err.message||err)));
+        break;
+      }
+      case "lg-claim-new": {
+        const code = ui.liveClaimGroup;
+        toast("Beitreten …");
+        lgJoinGroup(code, { asNew:true }).then(()=>{ toast("Beigetreten"); go("liveGroup"); })
+          .catch(err=>toast(String(err.message||err)));
+        break;
+      }
       case "lg-new-challenge": {
         ui.draft = { question:"", type:"YES_NO", options:["",""], durationMs:60*60e3, endMode:"duration", endAt:null,
           visibility:"SESSION", category:"Session", numMin:null, numMax:null, numDec:false, blocked:null,
