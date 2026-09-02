@@ -601,7 +601,7 @@
   const STATE_KEY = "challenge_proto_v2";
 
   let state = null;
-  const ui = { route:"home", chId:null, liveChId:null, liveClaimGroup:null, liveClaimMembers:null, liveClaimPick:null, draft:null, result:null, modal:null, rankTab:"community", pick:null, resolvePick:null, lgReResolve:false, bannerDismissed:false, disputeReason:null, confirmReset:false, sessionId:null, sessionForm:null, confirmEndSession:false, showDemo:false };
+  const ui = { route:"home", chId:null, liveChId:null, liveClaimGroup:null, liveClaimMembers:null, liveClaimPick:null, draft:null, result:null, modal:null, rankTab:"community", pick:null, resolvePick:null, lgReResolve:false, lgConfirmDel:false, lgManageMembers:false, lgKickPick:null, lgConfirmGroupDel:false, bannerDismissed:false, disputeReason:null, confirmReset:false, sessionId:null, sessionForm:null, confirmEndSession:false, showDemo:false };
 
   /* =========================================================
      helpers
@@ -1372,7 +1372,9 @@
      (Offline-Demo mit Bots). Kein Realtime – der Client fragt alle
      paar Sekunden selbst ab. Punkte werden aus den Tipps berechnet.
   ========================================================= */
-  const LG = { cfg:null, playerId:null, groupId:null, data:null, lastHash:"", busy:false, err:null, pollAt:0 };
+  const LG = { cfg:null, playerId:null, groupId:null, data:null, lastHash:"", busy:false, err:null, pollAt:0,
+    seen:null, seenMembers:null, seenInit:false, justActed:new Set() };
+  function lgResetSeen(){ LG.seen = new Map(); LG.seenMembers = new Set(); LG.seenInit = false; LG.justActed = new Set(); }
   const lgOn = () => !!(LG.cfg && LG.cfg.url && LG.cfg.key);
   const b64e = s => btoa(unescape(encodeURIComponent(s))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
   const b64d = s => decodeURIComponent(escape(atob(s.replace(/-/g,"+").replace(/_/g,"/"))));
@@ -1414,21 +1416,30 @@
     return u;
   }
 
+  const lgSleep = ms => new Promise(r => setTimeout(r, ms));
   async function lgReq(method, path, body, extra){
     if(!lgOn()) throw new Error("Live-Modus ist nicht eingerichtet.");
-    let res;
-    try{
-      res = await fetch(LG.cfg.url + "/rest/v1/" + path, {
-        method,
-        headers: Object.assign({
-          "apikey": LG.cfg.key,
-          "Authorization": "Bearer " + LG.cfg.key,
-          "Content-Type": "application/json",
-          "Prefer": (method === "POST" ? "return=representation" : "return=minimal")
-        }, extra || {}),
-        body: body ? JSON.stringify(body) : undefined
-      });
-    }catch(e){ throw new Error("Keine Verbindung zum Server (Internet? URL korrekt?)."); }
+    const opts = {
+      method,
+      headers: Object.assign({
+        "apikey": LG.cfg.key,
+        "Authorization": "Bearer " + LG.cfg.key,
+        "Content-Type": "application/json",
+        "Prefer": (method === "POST" ? "return=representation" : "return=minimal")
+      }, extra || {}),
+      body: body ? JSON.stringify(body) : undefined
+    };
+    let res, netErr = false;
+    // Bei wackligem Netz / kurzem Server-Hänger: einmal automatisch nochmal.
+    for(let attempt = 0; attempt < 2; attempt++){
+      try{
+        res = await fetch(LG.cfg.url + "/rest/v1/" + path, opts);
+        netErr = false;
+      }catch(e){ netErr = true; }
+      if(netErr){ if(attempt === 0){ await lgSleep(800); continue; } throw new Error("Keine Verbindung zum Server (Internet? URL korrekt?)."); }
+      if(res.status >= 500 && attempt === 0){ await lgSleep(800); continue; }
+      break;
+    }
     if(!res.ok){
       let t = ""; try{ t = await res.text(); }catch(e){}
       if(res.status === 401 || res.status === 403) throw new Error("Zugriff abgelehnt – anon-Schlüssel prüfen, SQL-Skript ausgeführt?");
@@ -1467,7 +1478,7 @@
     await lgReq("POST", "members?on_conflict=group_id,player_id",
       { group_id:code, player_id:LG.playerId, name:(state.user.username||"Spieler").slice(0,20), avatar:state.user.avatar || "🦊" },
       { "Prefer": "resolution=merge-duplicates,return=minimal" });
-    LG.groupId = code; LG.data = null; LG.lastHash = "";
+    LG.groupId = code; LG.data = null; LG.lastHash = ""; lgResetSeen();
     try{ localStorage.setItem("challenge_live_group", code); localStorage.removeItem("challenge_live_pendinggroup"); }catch(e){}
     ui.liveClaimGroup = null; ui.liveClaimMembers = null; ui.liveClaimPick = null;
     await lgPoll(true);
@@ -1478,13 +1489,13 @@
     if(!code || !pid) return;
     LG.playerId = pid;
     try{ localStorage.setItem("challenge_player_id", pid); }catch(e){}
-    LG.groupId = code; LG.data = null; LG.lastHash = "";
+    LG.groupId = code; LG.data = null; LG.lastHash = ""; lgResetSeen();
     try{ localStorage.setItem("challenge_live_group", code); localStorage.removeItem("challenge_live_pendinggroup"); }catch(e){}
     ui.liveClaimGroup = null; ui.liveClaimMembers = null; ui.liveClaimPick = null;
     await lgPoll(true);
   }
   function lgLeaveGroup(){
-    LG.groupId = null; LG.data = null; LG.lastHash = "";
+    LG.groupId = null; LG.data = null; LG.lastHash = ""; lgResetSeen();
     try{ localStorage.removeItem("challenge_live_group"); }catch(e){}
   }
 
@@ -1496,6 +1507,7 @@
       : d.options.filter(x=>x.trim()).map(mkOpt);
     if(d.type !== "YES_NO" && d.type !== "NUMBER" && options.length < 2) throw new Error("Mindestens 2 Antwortmöglichkeiten.");
     const id = uid();
+    LG.justActed.add(id);
     await lgReq("POST", "challenges", {
       id, group_id:LG.groupId, creator_id:LG.playerId, creator_name:(state.user.username||"Spieler").slice(0,20),
       question:d.question.trim(), type:d.type, options,
@@ -1536,6 +1548,7 @@
       factor = Math.round(f * 100) / 100;
       pseudo.participants.forEach(p => p.payoutCp = p.correct ? Math.round(SESSION_BASE * f) : 0);
     }
+    LG.justActed.add(chId);
     await lgReq("PATCH", "challenges?id=eq." + chId, { status:"resolved", outcome:String(outcome), factor });
     for(const p of pseudo.participants){
       await lgReq("PATCH", "tips?challenge_id=eq." + chId + "&player_id=eq." + encodeURIComponent(p.id),
@@ -1550,6 +1563,25 @@
     const w = r[0];
     await lgReq("PATCH", "groups?id=eq." + LG.groupId, { status:"ended", winner_id: w ? w.player_id : null, winner_name: w ? w.name : null });
     await lgPoll(true);
+  }
+  async function lgDeleteChallenge(id){
+    if(lgTipsFor(id).length) throw new Error("Es wurde schon getippt – nicht mehr löschbar.");
+    LG.justActed.add(id);
+    await lgReq("DELETE", "challenges?id=eq." + id);
+    if(LG.seen) LG.seen.delete(id);
+    await lgPoll(true);
+  }
+  async function lgKick(pid){
+    if(!lgIsHost()) throw new Error("Nur der Host kann Mitglieder entfernen.");
+    await lgReq("DELETE", "members?group_id=eq." + LG.groupId + "&player_id=eq." + encodeURIComponent(pid));
+    if(LG.seenMembers) LG.seenMembers.delete(pid);
+    ui.lgKickPick = null;
+    await lgPoll(true);
+  }
+  async function lgDeleteGroup(){
+    if(!lgIsHost()) throw new Error("Nur der Host kann die Gruppe löschen.");
+    await lgReq("DELETE", "groups?id=eq." + LG.groupId);  // cascade: members/challenges/tips
+    lgLeaveGroup();
   }
 
   async function lgPoll(force){
@@ -1568,21 +1600,51 @@
       if(!g || !g.length){ LG.err = null; toast("Gruppe wurde nicht gefunden."); lgLeaveGroup(); if(ui.route === "liveGroup" || ui.route === "liveChallenge") go("sessions"); return; }
       LG.data = { group:g[0], members:members || [], challenges:challenges || [], tips:tips || [] };
       LG.err = null;
+      lgDetectChanges();
       const hash = JSON.stringify(LG.data);
       if(hash !== LG.lastHash){
         LG.lastHash = hash;
-        if(ui.route === "sessions" || ui.route === "liveGroup" || ui.route === "liveChallenge"){
+        if(ui.route === "home" || ui.route === "sessions" || ui.route === "liveGroup" || ui.route === "liveChallenge"){
           const typing = document.activeElement && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
           if(!typing){ const v = document.getElementById("view"), sc = v.scrollTop; RENDER_SILENT = true; render(); v.scrollTop = sc; }
         }
       }
     }catch(e){
       LG.err = String(e && e.message || e);
-      if(ui.route === "sessions" || ui.route === "liveGroup" || ui.route === "liveChallenge"){
+      if(ui.route === "home" || ui.route === "sessions" || ui.route === "liveGroup" || ui.route === "liveChallenge"){
         const typing = document.activeElement && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
         if(!typing){ RENDER_SILENT = true; render(); }
       }
     }finally{ LG.busy = false; }
+  }
+
+  // Live-Hinweise: neue / aufgelöste Challenges, neue Mitglieder. Beim ersten Abruf still.
+  function lgDetectChanges(){
+    if(!LG.data) return;
+    if(!LG.seen) lgResetSeen();
+    const first = !LG.seenInit;
+    (LG.data.challenges || []).forEach(c=>{
+      const prev = LG.seen.get(c.id);
+      if(prev === undefined){
+        if(!first && c.creator_id !== LG.playerId && !LG.justActed.has(c.id))
+          toast("🆕 Neue Challenge: " + shorten(c.question, 38));
+      } else if(prev !== "resolved" && c.status === "resolved"){
+        if(!first && !LG.justActed.has(c.id)){
+          const mine = (LG.data.tips || []).find(t => t.challenge_id === c.id && t.player_id === LG.playerId);
+          const gain = (mine && mine.points > 0) ? " · +" + fmt(mine.points) + " Pkt" : "";
+          toast("✅ Aufgelöst: " + shorten(c.question, 26) + " → " + lgOptLabel(c, c.outcome) + gain);
+        }
+      }
+      LG.seen.set(c.id, c.status);
+      LG.justActed.delete(c.id);
+    });
+    (LG.data.members || []).forEach(m=>{
+      if(!LG.seenMembers.has(m.player_id)){
+        if(!first && m.player_id !== LG.playerId) toast("👋 " + m.name + " ist dabei");
+        LG.seenMembers.add(m.player_id);
+      }
+    });
+    LG.seenInit = true;
   }
 
   const lgChStatus = c => c.status === "resolved" ? "resolved" : (Date.now() >= new Date(c.locks_at).getTime() ? "locked" : "open");
@@ -1897,11 +1959,21 @@
     }
 
     const activeSessions = (state.sessions||[]).filter(s=>s.status==="active").length;
-    h += `<button class="session-card" data-nav="sessions">
-      <span class="sc-ic">🔒</span>
-      <span class="sc-txt"><span class="sc-title">Private Session</span><span class="sc-sub">${activeSessions>0 ? activeSessions+" aktiv · tippen ohne Limit" : "Mit Freunden, ohne Limit – z. B. fürs Wochenende"}</span></span>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
-    </button>`;
+    const liveG = (lgOn() && LG.groupId && LG.data && LG.data.group) ? LG.data.group : null;
+    if(liveG){
+      const openN = (LG.data.challenges||[]).filter(c=>lgChStatus(c)!=="resolved").length;
+      h += `<button class="session-card" data-act="lg-open">
+        <span class="sc-ic">👥</span>
+        <span class="sc-txt"><span class="sc-title">${esc(liveG.name)}</span><span class="sc-sub">${liveG.status==="ended" ? "beendet" : (LG.data.members||[]).length+" dabei · "+openN+" offen"}</span></span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+      </button>`;
+    } else {
+      h += `<button class="session-card" data-nav="sessions">
+        <span class="sc-ic">👥</span>
+        <span class="sc-txt"><span class="sc-title">Zusammen spielen</span><span class="sc-sub">${activeSessions>0 ? activeSessions+" Session aktiv" : "Mit Freunden, ohne Limit – z. B. fürs Wochenende"}</span></span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+      </button>`;
+    }
 
     if(state.wallet.balanceCp < CONFIG.wagerCp){
       const left = adBonusesLeft();
@@ -2659,7 +2731,10 @@
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="color:var(--win)">●</span><b>Live-Modus verbunden</b></div>
         ${LG.groupId ? `<div class="field"><label>Einladungslink (an deine Leute schicken)</label>
           <input class="text-input mono" style="font-size:12px" readonly value="${esc(link)}" data-invite onclick="this.select()">
-          <button class="btn sm" data-act="lg-copy" style="margin-top:8px">Link kopieren</button></div>` :
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button class="btn sm" data-act="lg-share" style="flex:1">Teilen</button>
+            <button class="btn sm" data-act="lg-copy" style="flex:1">Kopieren</button>
+          </div></div>` :
           `<p class="hint" style="margin-bottom:8px">Erstelle unten eine Gruppe – danach erscheint hier der Einladungslink.</p>`}
         <button class="btn subtle" style="width:100%;margin-top:6px" data-act="lg-disconnect">Live-Modus trennen</button>
       </div>`;
@@ -2903,6 +2978,29 @@
     </div>`).join("") || `<p class="empty" style="padding:16px">Noch niemand dabei.</p>`;
     h += `</div>`;
 
+    // Host: Mitglieder verwalten
+    if(host && !ended){
+      if(ui.lgManageMembers){
+        h += `<div class="card" style="padding:6px 0;margin:-8px 0 12px">`;
+        h += (LG.data.members || []).map(m=>{
+          const mt = (LG.data.tips || []).filter(t=>t.player_id === m.player_id).length;
+          const removable = m.player_id !== LG.playerId && m.player_id !== g.host_id && mt === 0;
+          return `<div class="rank-row">
+            <span class="rank-av">${m.avatar}</span>
+            <span class="rank-name" style="flex:1">${esc(m.name)}${m.player_id===LG.playerId?" (du)":""}<small>${mt} Tipps${m.player_id===g.host_id?" · Host":""}</small></span>
+            ${removable
+              ? (ui.lgKickPick===m.player_id
+                  ? `<button class="btn sm" data-act="lg-kick-go" data-pid="${esc(m.player_id)}" style="background:var(--hot);color:#fff">Entfernen?</button>`
+                  : `<button class="btn sm" data-act="lg-kick-ask" data-pid="${esc(m.player_id)}">✕</button>`)
+              : `<span class="hint" style="font-size:11px">${mt>0?"hat getippt":""}</span>`}
+          </div>`;
+        }).join("");
+        h += `</div><button class="btn subtle" style="width:100%;margin-bottom:16px" data-act="lg-manage-off">Fertig</button>`;
+      } else {
+        h += `<button class="btn subtle" style="width:100%;margin:-6px 0 16px" data-act="lg-manage-on">Mitglieder verwalten</button>`;
+      }
+    }
+
     if(!ended) h += `<button class="btn" data-act="lg-new-challenge" style="margin-bottom:16px">+ Challenge erstellen</button>`;
 
     h += `<div class="section-head"><h2>Offen</h2><span class="count">${open.length}</span></div>`;
@@ -2910,6 +3008,16 @@
     if(done.length){
       h += `<div class="section-head"><h2>Erledigt</h2></div>`;
       h += done.slice(0,20).map(lgChallengeCard).join("");
+    }
+
+    // Host: Testgruppe aufräumen
+    if(host){
+      h += ui.lgConfirmGroupDel
+        ? `<div style="margin-top:26px"><div style="display:flex;gap:8px">
+             <button class="btn subtle" style="flex:1" data-act="lg-gdel-cancel">Abbrechen</button>
+             <button class="btn" style="flex:1;background:var(--hot)" data-act="lg-gdel-go">Endgültig löschen</button>
+           </div><p class="hint" style="text-align:center;margin-top:6px">Löscht die Gruppe mit allen Challenges, Tipps und dem Ranking. Nicht rückgängig.</p></div>`
+        : `<button class="btn subtle" style="width:100%;margin-top:26px;color:var(--ink-faint);font-size:12px" data-act="lg-gdel-ask">Gruppe löschen (z. B. Testgruppe aufräumen)</button>`;
     }
     return h + `</div>`;
   }
@@ -2997,6 +3105,16 @@
              </div>
            </div>`
         : `<button class="btn subtle" style="width:100%;margin-top:16px" data-act="lg-rr-open">⚖ Ergebnis korrigieren</button>`;
+    }
+
+    // Challenge löschen – nur Ersteller:in/Host, nur solange noch niemand getippt hat
+    if(isCreator && !ended && st !== "resolved" && tips.length === 0){
+      h += ui.lgConfirmDel
+        ? `<div style="display:flex;gap:8px;margin-top:14px">
+             <button class="btn subtle" style="flex:1" data-act="lg-del-cancel">Abbrechen</button>
+             <button class="btn" style="flex:1;background:var(--hot)" data-act="lg-del-go">Challenge löschen</button>
+           </div>`
+        : `<button class="btn subtle" style="width:100%;margin-top:14px;color:var(--hot);border-color:color-mix(in srgb,var(--hot) 40%,var(--line-strong))" data-act="lg-del-ask">🗑 Challenge löschen</button>`;
     }
     return h + `</div>`;
   }
@@ -3157,7 +3275,8 @@
     if(opts && opts.chId) ui.chId = opts.chId;
     if(route!=="challenge" && route!=="dispute" && route!=="liveChallenge") ui.pick = null;
     if(route!=="challenge" && route!=="liveChallenge") ui.resolvePick = null;
-    if(route!=="liveChallenge") ui.lgReResolve = false;
+    if(route!=="liveChallenge"){ ui.lgReResolve = false; ui.lgConfirmDel = false; }
+    if(route!=="liveGroup"){ ui.lgManageMembers = false; ui.lgKickPick = null; ui.lgConfirmGroupDel = false; }
     if(route!=="liveClaim") ui.liveClaimPick = null;
     if(route!=="dispute") ui.disputeReason = null;
     ui.confirmReset = false;
@@ -3339,6 +3458,17 @@
         catch(e){ if(inp){inp.select();} toast("Kopieren: Link markieren & halten"); }
         break;
       }
+      case "lg-share": {
+        const link = lgInviteLink();
+        if(navigator.share){
+          navigator.share({ title:"CHALLENGE", text:"Komm in unsere Gruppe:", url:link }).catch(()=>{});
+        } else {
+          const inp = document.querySelector("[data-invite]");
+          try{ navigator.clipboard.writeText(link).then(()=>toast("Teilen nicht möglich – Link kopiert"), ()=>{ if(inp) inp.select(); }); }
+          catch(e){ if(inp) inp.select(); toast("Link markieren & halten zum Kopieren"); }
+        }
+        break;
+      }
       case "lg-form-create": ui.sessionForm = "createLive"; render(); break;
       case "lg-form-join": ui.sessionForm = "joinLive"; render(); break;
       case "lg-create-go": {
@@ -3412,9 +3542,8 @@
           out = String(c.num_dec ? round2(n) : Math.round(n));
         }
         if(out == null || out === "") return toast("Bitte zuerst das Ergebnis wählen");
-        ui.resolvePick = null; ui.lgReResolve = false;
         toast(redo ? "Wird neu berechnet …" : "Wird aufgelöst …");
-        lgResolve(ui.liveChId, out).then(()=>{ toast(redo ? "Ergebnis korrigiert · Punkte angepasst" : "Challenge beendet"); render(); })
+        lgResolve(ui.liveChId, out).then(()=>{ ui.resolvePick = null; ui.lgReResolve = false; toast(redo ? "Ergebnis korrigiert · Punkte angepasst" : "Challenge beendet"); render(); })
           .catch(err=>toast(String(err.message||err)));
         break;
       }
@@ -3422,6 +3551,31 @@
         ui.confirmEndSession = false;
         toast("Gruppe wird beendet …");
         lgEndGroup().then(()=>{ toast("Gruppe beendet"); render(); if(lgRanking()[0] && lgRanking()[0].player_id===LG.playerId) confetti(); })
+          .catch(err=>toast(String(err.message||err)));
+        break;
+      }
+      case "lg-del-ask": ui.lgConfirmDel = true; render(); break;
+      case "lg-del-cancel": ui.lgConfirmDel = false; render(); break;
+      case "lg-del-go": {
+        const id = ui.liveChId; ui.lgConfirmDel = false;
+        lgDeleteChallenge(id).then(()=>{ toast("Challenge gelöscht"); go("liveGroup"); })
+          .catch(err=>toast(String(err.message||err)));
+        break;
+      }
+      case "lg-manage-on": ui.lgManageMembers = true; render(); break;
+      case "lg-manage-off": ui.lgManageMembers = false; ui.lgKickPick = null; render(); break;
+      case "lg-kick-ask": ui.lgKickPick = t.dataset.pid; render(); break;
+      case "lg-kick-go": {
+        lgKick(t.dataset.pid).then(()=>{ toast("Mitglied entfernt"); render(); })
+          .catch(err=>toast(String(err.message||err)));
+        break;
+      }
+      case "lg-gdel-ask": ui.lgConfirmGroupDel = true; render(); break;
+      case "lg-gdel-cancel": ui.lgConfirmGroupDel = false; render(); break;
+      case "lg-gdel-go": {
+        ui.lgConfirmGroupDel = false;
+        toast("Gruppe wird gelöscht …");
+        lgDeleteGroup().then(()=>{ toast("Gruppe gelöscht"); go("sessions"); })
           .catch(err=>toast(String(err.message||err)));
         break;
       }
